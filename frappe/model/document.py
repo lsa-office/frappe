@@ -4,7 +4,9 @@ import hashlib
 import json
 import time
 from collections.abc import Generator, Iterable
-from typing import TYPE_CHECKING, Any, Optional
+from contextlib import contextmanager
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Literal, Optional, TypeAlias, Union, overload
 
 from werkzeug.exceptions import NotFound
 
@@ -87,6 +89,61 @@ def get_doc(*args, **kwargs):
 		return controller(*args, **kwargs)
 
 	raise ImportError(doctype)
+
+
+@contextmanager
+def read_only_document(context=None):
+	# Store original methods
+	original_methods = {
+		"save": Document.save,
+		"_save": Document._save,
+		"insert": Document.insert,
+		"delete": Document.delete,
+		"submit": Document.submit,
+		"cancel": Document.cancel,
+		"db_set": Document.db_set,
+	}
+
+	def read_only_method(func):
+		@wraps(func)
+		def wrapper(self, *args, **kwargs):
+			if self.doctype == "Error Log" and func.__name__ == "insert":
+				return original_methods["insert"](self, *args, **kwargs)
+			error_msg = f"Cannot call {func.__name__} in read-only document mode"
+			if context:
+				error_msg += f" ({context})"
+			raise frappe.DatabaseModificationError(error_msg)
+
+		return wrapper
+
+	# Use a thread-local variable to track nested invocations
+	if not hasattr(frappe.local, "read_only_depth"):
+		frappe.local.read_only_depth = 0
+
+	try:
+		# Increment the depth counter
+		frappe.local.read_only_depth += 1
+
+		# Only apply read-only methods if this is the outermost invocation
+		if frappe.local.read_only_depth == 1:
+			# Replace methods with read-only versions
+			for method_name, method in original_methods.items():
+				setattr(Document, method_name, read_only_method(method))
+
+		yield
+
+	finally:
+		# Decrement the depth counter
+		frappe.local.read_only_depth -= 1
+
+		# Only restore original methods if this is the outermost invocation
+		if frappe.local.read_only_depth == 0:
+			# Restore original methods
+			for method_name, method in original_methods.items():
+				setattr(Document, method_name, method)
+
+			# Clean up the thread-local variable
+			del frappe.local.read_only_depth
 
 
 class Document(BaseDocument):
@@ -238,7 +295,7 @@ class Document(BaseDocument):
 	def raise_no_permission_to(self, perm_type):
 		"""Raise `frappe.PermissionError`."""
 		frappe.flags.error_message = (
-			_("Insufficient Permission for {0}").format(self.doctype) + f" ({frappe.bold(_(perm_type))})"
+			_("Insufficient Permission for {0}").format(_(self.doctype)) + f" ({frappe.bold(_(perm_type))})"
 		)
 		raise frappe.PermissionError
 
@@ -458,7 +515,7 @@ class Document(BaseDocument):
 			d: Document
 			d.db_update()
 
-	def get_doc_before_save(self) -> "Document":
+	def get_doc_before_save(self) -> "Self":
 		return getattr(self, "_doc_before_save", None)
 
 	def has_value_changed(self, fieldname):
@@ -1031,7 +1088,7 @@ class Document(BaseDocument):
 			"on_cancel": "Cancel",
 		}
 
-		if not self.flags.in_insert:
+		if not self.flags.in_insert and not self.flags.in_delete:
 			# value change is not applicable in insert
 			event_map["on_change"] = "Value Change"
 
@@ -1373,12 +1430,6 @@ class Document(BaseDocument):
 	def validate_value(self, fieldname, condition, val2, doc=None, raise_exception=None):
 		"""Check that value of fieldname should be 'condition' val2
 		else throw Exception."""
-		error_condition_map = {
-			"in": _("one of"),
-			"not in": _("none of"),
-			"^": _("beginning with"),
-		}
-
 		if not doc:
 			doc = self
 
@@ -1389,13 +1440,21 @@ class Document(BaseDocument):
 
 		if not compare(val1, condition, val2):
 			label = doc.meta.get_label(fieldname)
-			condition_str = error_condition_map.get(condition, condition)
 			if doc.get("parentfield"):
-				msg = _("Incorrect value in row {0}: {1} must be {2} {3}").format(
-					doc.idx, label, condition_str, val2
-				)
+				msg = _("Incorrect value in row {0}:").format(doc.idx)
 			else:
-				msg = _("Incorrect value: {0} must be {1} {2}").format(label, condition_str, val2)
+				msg = _("Incorrect value:")
+
+			if condition == "in":
+				msg += _("{0} must be one of {1}").format(label, val2)
+			elif condition == "not in":
+				msg += _("{0} must be none of {1}").format(label, val2)
+			elif condition == "^":
+				msg += _("{0} must be beginning with '{1}'").format(label, val2)
+			elif condition == "=":
+				msg += _("{0} must be equal to '{1}'").format(label, val2)
+			else:
+				msg += _("{0} must be {1} {2}").format(label, condition, val2)
 
 			# raise passed exception or True
 			msgprint(msg, raise_exception=raise_exception or True)
@@ -1745,12 +1804,12 @@ def bulk_insert(
 	for child_table in doctype_meta.get_table_fields():
 		valid_column_map[child_table.options] = frappe.get_meta(child_table.options).get_valid_columns()
 		values_map[child_table.options] = _document_values_generator(
-			(
+			[
 				ch_doc
 				for ch_doc in (
 					child_docs for doc in documents for child_docs in doc.get(child_table.fieldname)
 				)
-			),
+			],
 			valid_column_map[child_table.options],
 		)
 
